@@ -76,6 +76,9 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         assert concept_bi["cells"][0]["x_total_documents"] > 0
         analytics = main.analytics_summary()
         assert len(analytics["top_words"]) <= 100
+        assert len(analytics["document_words"]) == analytics["documents"]
+        assert all(len(document["top_words"]) <= 100 for document in analytics["document_words"])
+        assert all(document["total_words"] >= document["unique_words"] for document in analytics["document_words"])
         assert len(analytics["model_metrics"]) == 4
         assert analytics["documents"] >= 20
         assert analytics["stage_metrics"]

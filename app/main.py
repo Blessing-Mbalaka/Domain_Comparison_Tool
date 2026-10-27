@@ -731,8 +731,11 @@ def phrases(paper_ids:str="",limit:int=Query(20,ge=1,le=100)):
 @app.get("/api/analytics/summary")
 def analytics_summary():
     with closing(connect()) as db:
-        paper_rows=db.execute("SELECT id,text_content,status FROM papers WHERE selected=1").fetchall()
-        tokens=[token for paper in paper_rows for token in tokenize(paper["text_content"])]
+        paper_rows=db.execute("SELECT id,title,text_content,status FROM papers WHERE selected=1 ORDER BY title,id").fetchall()
+        tokens=[]; document_words=[]
+        for paper in paper_rows:
+            paper_tokens=tokenize(paper["text_content"]); tokens.extend(paper_tokens); paper_counts=Counter(paper_tokens)
+            document_words.append({"id":paper["id"],"title":paper["title"],"total_words":len(paper_tokens),"unique_words":len(paper_counts),"top_words":[{"word":word,"count":count} for word,count in paper_counts.most_common(100)]})
         counts=Counter(tokens)
         model_rows=db.execute("SELECT r.model_id,AVG(r.semantic_score) semantic_score,AVG(r.coverage) coverage,AVG(r.concept_presence) concept_presence,AVG(r.exact_presence) exact_presence,COUNT(*) relationships FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.selected=1 GROUP BY r.model_id ORDER BY r.model_id").fetchall()
         model_names={model_id:name for model_id,name,_ in MODELS}
@@ -743,7 +746,7 @@ def analytics_summary():
             present=sum(1 for row in grouped if row["present"])
             stages.append({"id":category["id"],"name":category["name"],"domain":category["domain"],"present_documents":present,"total_documents":len(grouped),"presence_rate":round(present/max(1,len(grouped)),6),"semantic_score":round(sum(row["semantic_score"] for row in grouped)/max(1,len(grouped)),6)})
         job_counts={row["status"]:row["count"] for row in db.execute("SELECT status,COUNT(*) count FROM jobs GROUP BY status").fetchall()}
-        return {"documents":len(paper_rows),"ready_documents":sum(1 for row in paper_rows if row["status"]=="ready"),"total_words":len(tokens),"unique_words":len(counts),"top_words":[{"word":word,"count":count} for word,count in counts.most_common(100)],"model_metrics":model_metrics,"stage_metrics":stages,"jobs":job_counts}
+        return {"documents":len(paper_rows),"ready_documents":sum(1 for row in paper_rows if row["status"]=="ready"),"total_words":len(tokens),"unique_words":len(counts),"top_words":[{"word":word,"count":count} for word,count in counts.most_common(100)],"document_words":document_words,"model_metrics":model_metrics,"stage_metrics":stages,"jobs":job_counts}
 
 
 @app.get("/api/legacy-scores")
