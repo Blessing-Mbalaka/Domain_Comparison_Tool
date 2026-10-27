@@ -3,7 +3,7 @@ import {createRoot} from 'react-dom/client';
 import {BookOpen,ChevronDown,FileText,Layers3,Pencil,Plus,Search,Trash2,Upload,X} from 'lucide-react';
 import './styles.css';
 
-const api=async(path,opts={})=>{const r=await fetch('/api'+path,opts);if(!r.ok){let d;try{d=await r.json()}catch{d={detail:r.statusText}};throw new Error(d.detail||'Request failed')}if(r.status===204)return null;return r.json()};
+const api=async(path,opts={})=>{const r=await fetch('/api'+path,opts);if(r.status===204)return null;const type=r.headers.get('content-type')||'';if(!type.includes('application/json')){await r.text();throw new Error('The interface and server versions do not match. Stop the running server, run start.ps1 again, then refresh this page.')}let d;try{d=await r.json()}catch{throw new Error('The server returned an unreadable response. Restart start.ps1 and try again.')}if(!r.ok)throw new Error(d.detail||'Request failed');return d};
 const pct=n=>`${Math.round((n||0)*100)}%`;
 
 function App(){
