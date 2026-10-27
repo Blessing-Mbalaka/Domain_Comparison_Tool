@@ -551,6 +551,16 @@ def _corpus_pair_metrics(db: sqlite3.Connection, left_id: int, right_id: int, mo
     return (sum(supports) / len(supports) if supports else 0.0, sum(exacts) / len(exacts) if exacts else 0.0, sum(concepts) / len(concepts) if concepts else 0.0, len(supports))
 
 
+def _category_document_presence(db: sqlite3.Connection, category_id: int, model_ids: list[str], paper_ids: list[int]) -> tuple[int, int]:
+    params: list[Any] = [category_id, *model_ids]
+    paper_clause = ""
+    if paper_ids:
+        paper_clause = f" AND p.id IN ({','.join('?' * len(paper_ids))})"
+        params.extend(paper_ids)
+    grouped = db.execute(f"SELECT r.paper_id,MAX(r.concept_presence) present FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.selected=1 AND r.category_id=? AND r.model_id IN ({','.join('?' * len(model_ids))}){paper_clause} GROUP BY r.paper_id", params).fetchall()
+    return sum(1 for row in grouped if row["present"]), len(grouped)
+
+
 def _practice_guidance(research_name: str, pm_name: str, terms: list[str]) -> list[str]:
     name = pm_name.lower()
     actions = [
@@ -584,13 +594,15 @@ def stage_alignment(x_domain_id: int, y_domain_id: int, paper_ids: str = "", x_c
         yrows = db.execute("SELECT * FROM categories WHERE domain_id=? ORDER BY position,id", (y_domain_id,)).fetchall()
         if xids: xrows = [x for x in xrows if x["id"] in xids]
         if yids: yrows = [y for y in yrows if y["id"] in yids]
+        presence = {category_id: _category_document_presence(db, category_id, mids, pids) for category_id in {row["id"] for row in [*xrows, *yrows]}}
         cells = []
         for y in yrows:
             for x in xrows:
                 alignment = sum(_stage_score(db, y, x, mid) for mid in mids) / len(mids)
                 support, exact, concept, observations = _corpus_pair_metrics(db, y["id"], x["id"], mids, pids)
                 values = {"alignment": alignment, "corpus_support": support, "concept_presence": concept, "exact_presence": exact}
-                cells.append({"x_category_id": x["id"], "y_category_id": y["id"], "x_name": x["name"], "y_name": y["name"], "alignment": round(alignment, 6), "corpus_support": round(support, 6), "concept_presence": round(concept, 6), "exact_presence": round(exact, 6), "observations": observations, "value": round(values[metric], 6)})
+                x_present, x_total = presence[x["id"]]; y_present, y_total = presence[y["id"]]
+                cells.append({"x_category_id": x["id"], "y_category_id": y["id"], "x_name": x["name"], "y_name": y["name"], "alignment": round(alignment, 6), "corpus_support": round(support, 6), "concept_presence": round(concept, 6), "exact_presence": round(exact, 6), "x_present_documents": x_present, "x_total_documents": x_total, "y_present_documents": y_present, "y_total_documents": y_total, "observations": observations, "value": round(values[metric], 6)})
         xd = db.execute("SELECT name FROM domains WHERE id=?", (x_domain_id,)).fetchone()
         yd = db.execute("SELECT name FROM domains WHERE id=?", (y_domain_id,)).fetchone()
         if not xd or not yd: raise HTTPException(404, "Domain not found")

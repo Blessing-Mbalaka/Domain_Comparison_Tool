@@ -59,6 +59,9 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         assert len(bi["cells"]) == 72
         concept_bi = main.stage_alignment(pm_id, domain_id, model_ids="mpnet-primary", metric="concept_presence")
         assert all(0 <= cell["concept_presence"] <= 1 for cell in concept_bi["cells"])
+        assert all(0 <= cell["x_present_documents"] <= cell["x_total_documents"] for cell in concept_bi["cells"])
+        assert all(0 <= cell["y_present_documents"] <= cell["y_total_documents"] for cell in concept_bi["cells"])
+        assert concept_bi["cells"][0]["x_total_documents"] > 0
         detail = main.stage_alignment_detail(pm_stage, research_stage, model_ids="mpnet-primary")
         assert detail["recommendations"]
         assert 0 <= detail["alignment"] <= 1
