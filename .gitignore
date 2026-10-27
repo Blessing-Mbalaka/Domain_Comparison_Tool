@@ -10,6 +10,8 @@ frontend/node_modules/
 data/*.sqlite3*
 data/uploads/*
 !data/uploads/.gitkeep
+server*.out
+server*.err
 00_master_*.html
 00_model_disagreement.html
 bge-robustness/
