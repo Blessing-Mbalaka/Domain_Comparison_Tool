@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: research-atlas
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: SEMANTIC_DASHBOARD_DB
+        value: /app/data/dashboard.sqlite3
+    disk:
+      name: research-atlas-data
+      mountPath: /app/data
+      sizeGB: 1
