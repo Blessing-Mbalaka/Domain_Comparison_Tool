@@ -26,6 +26,15 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         assert rel is not None
         assert json.loads(rel["top_terms"])
         assert json.loads(rel["evidence"])
+        assert rel["exact_presence"] == 0
+        assert rel["concept_presence"] == 1
+        assert rel["presence_reason"].startswith("synonym:")
+        classified = main.update_paper(pid, main.PaperIn(title="Upload test", text_content="Risk management uses qualitative interviews and project controls.", stage_id=cid))
+        assert classified["recalculation"] is True
+        assert main.process_one_job() is True
+        classified_rel = db.execute("SELECT concept_presence,presence_reason FROM relationships WHERE paper_id=? AND category_id=? AND model_id='mpnet-primary'", (pid, cid)).fetchone()
+        assert classified_rel["concept_presence"] == 1
+        assert classified_rel["presence_reason"] == "classified stage"
         edited_text = "Corrected spelling for qualitative interview analysis and project risk controls."
         edited = main.update_paper(pid, main.PaperIn(title="Corrected upload title", text_content=edited_text))
         assert edited["recalculation"] is True
@@ -48,6 +57,8 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         assert len(bi["columns"]) == 12
         assert len(bi["rows"]) == 6
         assert len(bi["cells"]) == 72
+        concept_bi = main.stage_alignment(pm_id, domain_id, model_ids="mpnet-primary", metric="concept_presence")
+        assert all(0 <= cell["concept_presence"] <= 1 for cell in concept_bi["cells"])
         detail = main.stage_alignment_detail(pm_stage, research_stage, model_ids="mpnet-primary")
         assert detail["recommendations"]
         assert 0 <= detail["alignment"] <= 1

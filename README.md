@@ -16,6 +16,8 @@ From this folder in PowerShell:
 
 Open <http://127.0.0.1:9001>. Data is stored in `data/dashboard.sqlite3`; uploaded source files are kept in `data/uploads`. The database is seeded only when first created, so edits and deletions survive restarts.
 
+Each new upload must be assigned to an existing analytical stage. The dashboard keeps exact phrase presence as a separate audit signal and also calculates concept presence: a document counts as present when its assigned stage matches, the stage name appears exactly, a configured synonym appears, or the selected model reaches at least 0.80 cosine similarity. Corpus presence is the proportion of selected documents meeting that rule and is recalculated incrementally after uploads or edits.
+
 ## Development
 
 ```powershell

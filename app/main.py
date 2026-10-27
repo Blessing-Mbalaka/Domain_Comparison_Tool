@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS domains(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,description TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY,domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',synonyms TEXT NOT NULL DEFAULT '[]',position INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(domain_id,name));
 CREATE TABLE IF NOT EXISTS papers(id INTEGER PRIMARY KEY,title TEXT NOT NULL,filename TEXT,source_path TEXT,text_content TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'ready',selected INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS paper_categories(paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY,paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,chunk_index INTEGER NOT NULL,text TEXT NOT NULL,term_counts TEXT NOT NULL DEFAULT '{}',UNIQUE(paper_id,chunk_index));
 CREATE TABLE IF NOT EXISTS embeddings(id INTEGER PRIMARY KEY,entity_type TEXT NOT NULL,entity_id INTEGER NOT NULL,model_id TEXT NOT NULL,vector TEXT NOT NULL,content_hash TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(entity_type,entity_id,model_id));
 CREATE TABLE IF NOT EXISTS relationships(id INTEGER PRIMARY KEY,paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,model_id TEXT NOT NULL,semantic_score REAL NOT NULL,coverage REAL NOT NULL,exact_presence REAL NOT NULL,evidence TEXT NOT NULL DEFAULT '[]',top_terms TEXT NOT NULL DEFAULT '[]',updated_at TEXT NOT NULL,UNIQUE(paper_id,category_id,model_id));
@@ -70,6 +71,17 @@ CREATE INDEX IF NOT EXISTS idx_rel_paper ON relationships(paper_id);
 CREATE INDEX IF NOT EXISTS idx_rel_category ON relationships(category_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 """
+
+
+def migrate_schema(db: sqlite3.Connection) -> None:
+    """Add compatible columns to databases created by earlier dashboard versions."""
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(relationships)").fetchall()}
+    if "concept_presence" not in columns:
+        db.execute("ALTER TABLE relationships ADD COLUMN concept_presence REAL NOT NULL DEFAULT 0")
+    if "presence_reason" not in columns:
+        db.execute("ALTER TABLE relationships ADD COLUMN presence_reason TEXT NOT NULL DEFAULT 'not detected'")
+    db.execute("CREATE TABLE IF NOT EXISTS paper_categories(paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,created_at TEXT NOT NULL)")
+    db.commit()
 
 
 def emit(db: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> None:
@@ -144,7 +156,10 @@ def evaluate(db: sqlite3.Connection, paper_id: int, category_id: int) -> None:
     terms = list(dict.fromkeys(tokenize(cat["name"] + " " + " ".join(json.loads(cat["synonyms"] or "[]")))))
     hits = [{"term": t, "count": ptoks[t]} for t in terms if ptoks[t]]
     coverage = len(hits) / max(1, len(terms))
-    exact = 1.0 if cat["name"].lower() in paper["text_content"].lower() else 0.0
+    normalized_text = re.sub(r"\s+", " ", paper["text_content"].lower())
+    exact = 1.0 if re.sub(r"\s+", " ", cat["name"].lower()).strip() in normalized_text else 0.0
+    synonym = next((s for s in json.loads(cat["synonyms"] or "[]") if s.strip() and re.sub(r"\s+", " ", s.lower()).strip() in normalized_text), None)
+    classified = db.execute("SELECT 1 FROM paper_categories WHERE paper_id=? AND category_id=?", (paper_id, category_id)).fetchone() is not None
     chunk_rows = db.execute("SELECT * FROM chunks WHERE paper_id=? ORDER BY chunk_index", (paper_id,)).fetchall()
     for model_id, _, _ in MODELS:
         cv = cache_embedding(db, "category", category_id, model_id, ctext)
@@ -160,7 +175,10 @@ def evaluate(db: sqlite3.Connection, paper_id: int, category_id: int) -> None:
             score = cosine(embed(ch["text"], model_id), cv)
             evidence.append({"chunk": ch["chunk_index"], "score": round(score, 4), "text": ch["text"][:520]})
         evidence.sort(key=lambda x: x["score"], reverse=True)
-        db.execute("INSERT INTO relationships(paper_id,category_id,model_id,semantic_score,coverage,exact_presence,evidence,top_terms,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(paper_id,category_id,model_id) DO UPDATE SET semantic_score=excluded.semantic_score,coverage=excluded.coverage,exact_presence=excluded.exact_presence,evidence=excluded.evidence,top_terms=excluded.top_terms,updated_at=excluded.updated_at", (paper_id, category_id, model_id, round(semantic, 6), round(coverage, 6), exact, json.dumps(evidence[:5]), json.dumps(ranked_terms[:12]), now()))
+        presence_similarity = max(semantic, evidence[0]["score"] if evidence else 0.0)
+        concept = 1.0 if classified or exact or synonym or presence_similarity >= 0.80 else 0.0
+        reason = "classified stage" if classified else "exact phrase" if exact else f"synonym: {synonym}" if synonym else f"semantic: {presence_similarity:.0%}" if presence_similarity >= 0.80 else "not detected"
+        db.execute("INSERT INTO relationships(paper_id,category_id,model_id,semantic_score,coverage,exact_presence,concept_presence,presence_reason,evidence,top_terms,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(paper_id,category_id,model_id) DO UPDATE SET semantic_score=excluded.semantic_score,coverage=excluded.coverage,exact_presence=excluded.exact_presence,concept_presence=excluded.concept_presence,presence_reason=excluded.presence_reason,evidence=excluded.evidence,top_terms=excluded.top_terms,updated_at=excluded.updated_at", (paper_id, category_id, model_id, round(semantic, 6), round(coverage, 6), exact, concept, reason, json.dumps(evidence[:5]), json.dumps(ranked_terms[:12]), now()))
 
 
 def prepare_paper(db: sqlite3.Connection, paper_id: int) -> None:
@@ -203,8 +221,10 @@ def seed_demo_presence(db: sqlite3.Connection) -> None:
 
 def seed(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
+    migrate_schema(db)
     if db.execute("SELECT value FROM meta WHERE key='seed_version'").fetchone():
         seed_demo_presence(db)
+        refresh_concept_presence_once(db)
         return
     stamp = now()
     pm = db.execute("INSERT INTO domains(name,description,created_at) VALUES(?,?,?)", ("Project Management", "Lifecycle stages imported from the verified multi-model heatmaps.", stamp)).lastrowid
@@ -248,6 +268,21 @@ def seed(db: sqlite3.Connection) -> None:
     emit(db, "seed.completed", {"categories": len(names) + len(research_defaults), "papers": len(names), "legacy_scores": len(legacy_rows)})
     db.commit()
     seed_demo_presence(db)
+    refresh_concept_presence_once(db)
+
+
+def refresh_concept_presence_once(db: sqlite3.Connection) -> None:
+    """Backfill the richer presence rule once without changing user records."""
+    if db.execute("SELECT value FROM meta WHERE key='concept_presence_version'").fetchone():
+        return
+    paper_ids = [row["id"] for row in db.execute("SELECT id FROM papers").fetchall()]
+    category_ids = [row["id"] for row in db.execute("SELECT id FROM categories").fetchall()]
+    for paper_id in paper_ids:
+        for category_id in category_ids:
+            evaluate(db, paper_id, category_id)
+    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('concept_presence_version','1')")
+    emit(db, "concept.presence.migrated", {"papers": len(paper_ids), "categories": len(category_ids), "threshold": 0.80})
+    db.commit()
 
 
 def queue_job(db: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> int:
@@ -319,6 +354,7 @@ class CategoryIn(BaseModel):
 class PaperIn(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     text_content: str = Field(min_length=1, max_length=5_000_000)
+    stage_id: int | None = None
 
 
 def rows(sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -409,13 +445,13 @@ def extract_file(path: Path) -> str:
 
 
 @app.get("/api/papers")
-def papers(): return rows("SELECT id,title,filename,source_path,status,selected,created_at,updated_at,length(text_content) AS characters FROM papers ORDER BY id DESC")
+def papers(): return rows("SELECT p.id,p.title,p.filename,p.source_path,p.status,p.selected,p.created_at,p.updated_at,length(p.text_content) AS characters,pc.category_id stage_id,c.name stage_name FROM papers p LEFT JOIN paper_categories pc ON pc.paper_id=p.id LEFT JOIN categories c ON c.id=pc.category_id ORDER BY p.id DESC")
 
 
 @app.get("/api/papers/{paper_id}")
 def paper_detail(paper_id: int):
     with closing(connect()) as db:
-        row = db.execute("SELECT id,title,filename,source_path,text_content,status,selected,created_at,updated_at FROM papers WHERE id=?", (paper_id,)).fetchone()
+        row = db.execute("SELECT p.id,p.title,p.filename,p.source_path,p.text_content,p.status,p.selected,p.created_at,p.updated_at,pc.category_id stage_id,c.name stage_name FROM papers p LEFT JOIN paper_categories pc ON pc.paper_id=p.id LEFT JOIN categories c ON c.id=pc.category_id WHERE p.id=?", (paper_id,)).fetchone()
         if not row: raise HTTPException(404, "Paper not found")
         return dict(row)
 
@@ -428,19 +464,27 @@ def update_paper(paper_id: int, body: PaperIn):
         current = db.execute("SELECT title,text_content,status FROM papers WHERE id=?", (paper_id,)).fetchone()
         if not current: raise HTTPException(404, "Paper not found")
         text_changed = current["text_content"] != text
-        status = "queued" if text_changed else current["status"]
+        old_stage = db.execute("SELECT category_id FROM paper_categories WHERE paper_id=?", (paper_id,)).fetchone()
+        stage_supplied = "stage_id" in body.model_fields_set
+        stage_changed = stage_supplied and (old_stage["category_id"] if old_stage else None) != body.stage_id
+        if body.stage_id is not None and not db.execute("SELECT 1 FROM categories WHERE id=?", (body.stage_id,)).fetchone(): raise HTTPException(422, "Selected research stage does not exist")
+        if stage_supplied:
+            db.execute("DELETE FROM paper_categories WHERE paper_id=?", (paper_id,))
+            if body.stage_id is not None: db.execute("INSERT INTO paper_categories(paper_id,category_id,created_at) VALUES(?,?,?)", (paper_id, body.stage_id, now()))
+        recalculation = text_changed or stage_changed
+        status = "queued" if recalculation else current["status"]
         db.execute("UPDATE papers SET title=?,text_content=?,status=?,updated_at=? WHERE id=?", (title, text, status, now(), paper_id))
-        if text_changed:
+        if recalculation:
             db.execute("DELETE FROM embeddings WHERE entity_type='paper' AND entity_id=?", (paper_id,))
             db.execute("DELETE FROM relationships WHERE paper_id=?", (paper_id,))
             job_id = queue_job(db, "paper.process", {"paper_id": paper_id})
         else:
             emit(db, "paper.updated", {"id": paper_id, "recalculation": False}); db.commit(); job_id = None
-        return {"id": paper_id, "status": status, "job_id": job_id, "recalculation": text_changed}
+        return {"id": paper_id, "status": status, "job_id": job_id, "recalculation": recalculation}
 
 
 @app.post("/api/papers/upload", status_code=202)
-async def upload_paper(file: UploadFile=File(...), title: str=Form("")):
+async def upload_paper(file: UploadFile=File(...), title: str=Form(""), stage_id: int=Form(...)):
     suffix=Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED: raise HTTPException(415,"Upload a PDF, DOCX or TXT file")
     blob=await file.read()
@@ -450,7 +494,9 @@ async def upload_paper(file: UploadFile=File(...), title: str=Form("")):
     except Exception as exc: path.unlink(missing_ok=True); raise HTTPException(422,f"Could not extract text: {exc}")
     if not text.strip(): path.unlink(missing_ok=True); raise HTTPException(422,"No readable text was extracted")
     with closing(connect()) as db:
+        if not db.execute("SELECT 1 FROM categories WHERE id=?", (stage_id,)).fetchone(): path.unlink(missing_ok=True); raise HTTPException(422,"Selected research stage does not exist")
         stamp=now(); pid=db.execute("INSERT INTO papers(title,filename,source_path,text_content,status,selected,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(title.strip() or Path(file.filename or "Untitled").stem,file.filename,str(path),text,"queued",1,stamp,stamp)).lastrowid
+        db.execute("INSERT INTO paper_categories(paper_id,category_id,created_at) VALUES(?,?,?)", (pid, stage_id, stamp))
         jid=queue_job(db,"paper.process",{"paper_id":pid}); return {"paper_id":pid,"job_id":jid,"status":"queued","characters":len(text)}
 
 
@@ -486,22 +532,23 @@ def _stage_score(db: sqlite3.Connection, left: sqlite3.Row, right: sqlite3.Row, 
     return cosine(embed(category_text(left), model_id), embed(category_text(right), model_id))
 
 
-def _corpus_pair_metrics(db: sqlite3.Connection, left_id: int, right_id: int, model_ids: list[str], paper_ids: list[int]) -> tuple[float, float, int]:
+def _corpus_pair_metrics(db: sqlite3.Connection, left_id: int, right_id: int, model_ids: list[str], paper_ids: list[int]) -> tuple[float, float, float, int]:
     params: list[Any] = [left_id, right_id, *model_ids]
     paper_clause = ""
     if paper_ids:
         paper_clause = f" AND p.id IN ({','.join('?' * len(paper_ids))})"
         params.extend(paper_ids)
-    found = db.execute(f"SELECT r.paper_id,r.model_id,r.category_id,r.semantic_score,r.exact_presence FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.selected=1 AND r.category_id IN (?,?) AND r.model_id IN ({','.join('?' * len(model_ids))}){paper_clause}", params).fetchall()
-    paired: dict[tuple[int, str], dict[int, tuple[float, float]]] = {}
+    found = db.execute(f"SELECT r.paper_id,r.model_id,r.category_id,r.semantic_score,r.exact_presence,r.concept_presence FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.selected=1 AND r.category_id IN (?,?) AND r.model_id IN ({','.join('?' * len(model_ids))}){paper_clause}", params).fetchall()
+    paired: dict[tuple[int, str], dict[int, tuple[float, float, float]]] = {}
     for row in found:
-        paired.setdefault((row["paper_id"], row["model_id"]), {})[row["category_id"]] = (row["semantic_score"], row["exact_presence"])
-    supports, exacts = [], []
+        paired.setdefault((row["paper_id"], row["model_id"]), {})[row["category_id"]] = (row["semantic_score"], row["exact_presence"], row["concept_presence"])
+    supports, exacts, concepts = [], [], []
     for values in paired.values():
         if left_id in values and right_id in values:
             supports.append(math.sqrt(values[left_id][0] * values[right_id][0]))
             exacts.append(1.0 if values[left_id][1] and values[right_id][1] else 0.0)
-    return (sum(supports) / len(supports) if supports else 0.0, sum(exacts) / len(exacts) if exacts else 0.0, len(supports))
+            concepts.append(1.0 if values[left_id][2] and values[right_id][2] else 0.0)
+    return (sum(supports) / len(supports) if supports else 0.0, sum(exacts) / len(exacts) if exacts else 0.0, sum(concepts) / len(concepts) if concepts else 0.0, len(supports))
 
 
 def _practice_guidance(research_name: str, pm_name: str, terms: list[str]) -> list[str]:
@@ -529,7 +576,7 @@ def _practice_guidance(research_name: str, pm_name: str, terms: list[str]) -> li
 
 
 @app.get("/api/stage-alignment")
-def stage_alignment(x_domain_id: int, y_domain_id: int, paper_ids: str = "", x_category_ids: str = "", y_category_ids: str = "", model_ids: str = "", metric: str = Query("alignment", pattern="^(alignment|corpus_support|exact_presence)$")):
+def stage_alignment(x_domain_id: int, y_domain_id: int, paper_ids: str = "", x_category_ids: str = "", y_category_ids: str = "", model_ids: str = "", metric: str = Query("alignment", pattern="^(alignment|corpus_support|concept_presence|exact_presence)$")):
     mids = [x for x in model_ids.split(",") if x] or [x[0] for x in MODELS]
     pids, xids, yids = _selected_ids(paper_ids), _selected_ids(x_category_ids), _selected_ids(y_category_ids)
     with closing(connect()) as db:
@@ -541,9 +588,9 @@ def stage_alignment(x_domain_id: int, y_domain_id: int, paper_ids: str = "", x_c
         for y in yrows:
             for x in xrows:
                 alignment = sum(_stage_score(db, y, x, mid) for mid in mids) / len(mids)
-                support, exact, observations = _corpus_pair_metrics(db, y["id"], x["id"], mids, pids)
-                values = {"alignment": alignment, "corpus_support": support, "exact_presence": exact}
-                cells.append({"x_category_id": x["id"], "y_category_id": y["id"], "x_name": x["name"], "y_name": y["name"], "alignment": round(alignment, 6), "corpus_support": round(support, 6), "exact_presence": round(exact, 6), "observations": observations, "value": round(values[metric], 6)})
+                support, exact, concept, observations = _corpus_pair_metrics(db, y["id"], x["id"], mids, pids)
+                values = {"alignment": alignment, "corpus_support": support, "concept_presence": concept, "exact_presence": exact}
+                cells.append({"x_category_id": x["id"], "y_category_id": y["id"], "x_name": x["name"], "y_name": y["name"], "alignment": round(alignment, 6), "corpus_support": round(support, 6), "concept_presence": round(concept, 6), "exact_presence": round(exact, 6), "observations": observations, "value": round(values[metric], 6)})
         xd = db.execute("SELECT name FROM domains WHERE id=?", (x_domain_id,)).fetchone()
         yd = db.execute("SELECT name FROM domains WHERE id=?", (y_domain_id,)).fetchone()
         if not xd or not yd: raise HTTPException(404, "Domain not found")
@@ -559,7 +606,7 @@ def stage_alignment_detail(x_category_id: int, y_category_id: int, paper_ids: st
         y = db.execute("SELECT c.*,d.name domain_name FROM categories c JOIN domains d ON d.id=c.domain_id WHERE c.id=?", (y_category_id,)).fetchone()
         if not x or not y: raise HTTPException(404, "Category not found")
         alignment = sum(_stage_score(db, y, x, mid) for mid in mids) / len(mids)
-        support, exact, observations = _corpus_pair_metrics(db, y["id"], x["id"], mids, pids)
+        support, exact, concept, observations = _corpus_pair_metrics(db, y["id"], x["id"], mids, pids)
         params: list[Any] = []
         paper_clause = "p.selected=1"
         if pids:
@@ -588,11 +635,11 @@ def stage_alignment_detail(x_category_id: int, y_category_id: int, paper_ids: st
             recommendations = _practice_guidance(research["name"], pm["name"], terms)
         else:
             recommendations = [f"Use the overlap between {y['name']} and {x['name']} to define an explicit hand-off, shared output or decision gate.", "Review highly similar stages for duplicated work; review weakly aligned stages for missing dependencies.", "Assign an owner and measurable completion criterion to each stage so semantic overlap does not become responsibility overlap."]
-        return {"x_category_id": x["id"], "y_category_id": y["id"], "x_name": x["name"], "y_name": y["name"], "x_domain": x["domain_name"], "y_domain": y["domain_name"], "alignment": round(alignment, 6), "corpus_support": round(support, 6), "exact_presence": round(exact, 6), "observations": observations, "top_terms": ranked[:12], "evidence": passages[:6], "recommendations": recommendations}
+        return {"x_category_id": x["id"], "y_category_id": y["id"], "x_name": x["name"], "y_name": y["name"], "x_domain": x["domain_name"], "y_domain": y["domain_name"], "alignment": round(alignment, 6), "corpus_support": round(support, 6), "concept_presence": round(concept, 6), "exact_presence": round(exact, 6), "observations": observations, "top_terms": ranked[:12], "evidence": passages[:6], "recommendations": recommendations}
 
 
 @app.get("/api/heatmap")
-def heatmap(domain_id:int|None=None,paper_ids:str="",category_ids:str="",model_ids:str="",metric:str=Query("semantic_score",pattern="^(semantic_score|coverage|exact_presence)$")):
+def heatmap(domain_id:int|None=None,paper_ids:str="",category_ids:str="",model_ids:str="",metric:str=Query("semantic_score",pattern="^(semantic_score|coverage|concept_presence|exact_presence)$")):
     pids=[int(x) for x in paper_ids.split(",") if x.isdigit()]
     cids=[int(x) for x in category_ids.split(",") if x.isdigit()]
     mids=[x for x in model_ids.split(",") if x] or [x[0] for x in MODELS]
@@ -612,7 +659,8 @@ def evidence(paper_id:int,category_id:int,model_id:str="mpnet-primary"):
     with closing(connect()) as db:
         r=db.execute("SELECT r.*,p.title paper_title,c.name category_name FROM relationships r JOIN papers p ON p.id=r.paper_id JOIN categories c ON c.id=r.category_id WHERE paper_id=? AND category_id=? AND model_id=?",(paper_id,category_id,model_id)).fetchone()
         if not r: raise HTTPException(404,"No evaluated relationship")
-        out=dict(r); out["evidence"]=json.loads(out["evidence"]); out["top_terms"]=json.loads(out["top_terms"]); return out
+        aggregate=db.execute("SELECT COUNT(*) total,SUM(r.concept_presence) present FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.selected=1 AND r.category_id=? AND r.model_id=?",(category_id,model_id)).fetchone()
+        out=dict(r); out["evidence"]=json.loads(out["evidence"]); out["top_terms"]=json.loads(out["top_terms"]); out["present_documents"]=int(aggregate["present"] or 0); out["total_documents"]=int(aggregate["total"] or 0); out["corpus_presence"]=round(out["present_documents"] / max(1,out["total_documents"]),6); return out
 
 
 @app.get("/api/top-phrases")

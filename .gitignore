@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .test-temp*/
 .test-*/
+.manual-*/
 tmp*/
 debugdata*/
 .venv/
