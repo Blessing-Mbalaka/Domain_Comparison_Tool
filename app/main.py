@@ -749,6 +749,34 @@ def analytics_summary():
         return {"documents":len(paper_rows),"ready_documents":sum(1 for row in paper_rows if row["status"]=="ready"),"total_words":len(tokens),"unique_words":len(counts),"top_words":[{"word":word,"count":count} for word,count in counts.most_common(100)],"document_words":document_words,"model_metrics":model_metrics,"stage_metrics":stages,"jobs":job_counts}
 
 
+@app.get("/api/analytics/relevant-terms")
+def relevant_terms(category_id:int,paper_id:int|None=None,threshold:float=Query(.60,ge=0,le=1),limit:int=Query(100,ge=1,le=100),model_ids:str=""):
+    mids=[model_id for model_id in model_ids.split(",") if model_id] or [model_id for model_id,_,_ in MODELS]
+    valid={model_id for model_id,_,_ in MODELS}
+    if any(model_id not in valid for model_id in mids): raise HTTPException(422,"Unknown semantic model")
+    with closing(connect()) as db:
+        category=db.execute("SELECT c.*,d.name domain_name FROM categories c JOIN domains d ON d.id=c.domain_id WHERE c.id=?",(category_id,)).fetchone()
+        if not category: raise HTTPException(404,"Stage not found")
+        corpus=db.execute("SELECT id,title,text_content FROM papers WHERE selected=1 ORDER BY title,id").fetchall()
+        if paper_id is not None and not any(row["id"]==paper_id for row in corpus): raise HTTPException(404,"Selected paper not found in the active corpus")
+        document_frequency=Counter()
+        corpus_counts=Counter()
+        for paper in corpus:
+            paper_tokens=tokenize(paper["text_content"]); corpus_counts.update(paper_tokens); document_frequency.update(set(paper_tokens))
+        minimum_docs=max(3,math.ceil(len(corpus)*.70))
+        dataset_stopwords={term for term,frequency in document_frequency.items() if frequency>=minimum_docs and corpus_counts[term]>=minimum_docs}
+        source=next((row for row in corpus if row["id"]==paper_id),None) if paper_id is not None else None
+        source_counts=Counter(tokenize(source["text_content"])) if source else corpus_counts
+        candidates=[(term,count) for term,count in source_counts.items() if term not in dataset_stopwords and term not in STOP and len(term)>2]
+        target=category_text(category); target_vectors={model_id:embed(target,model_id) for model_id in mids}
+        ranked=[]
+        for term,count in candidates:
+            similarity=sum(cosine(embed(term,model_id),target_vectors[model_id]) for model_id in mids)/len(mids)
+            if similarity>=threshold: ranked.append({"term":term,"count":count,"similarity":round(similarity,4)})
+        ranked.sort(key=lambda item:(item["similarity"],item["count"]),reverse=True)
+        return {"category_id":category_id,"category_name":category["name"],"category_description":category["description"],"domain":category["domain_name"],"paper_id":paper_id,"paper_title":source["title"] if source else None,"threshold":threshold,"models":mids,"candidate_terms":len(candidates),"matched_terms":len(ranked),"dataset_stopword_count":len(dataset_stopwords),"dataset_stopwords":sorted(dataset_stopwords,key=lambda term:(-document_frequency[term],term))[:40],"terms":ranked[:limit]}
+
+
 @app.get("/api/legacy-scores")
 def legacy_scores(model_id:str="mpnet-primary",metric:str=Query("best_match",pattern="^(best_match|all_pairs)$")):
     return rows(f"SELECT l.model_id,l.reference_category_id,l.comparison_category_id,a.name reference,b.name comparison,l.{metric} value,l.source_href FROM legacy_scores l JOIN categories a ON a.id=l.reference_category_id JOIN categories b ON b.id=l.comparison_category_id WHERE l.model_id=? ORDER BY a.position,b.position",(model_id,))

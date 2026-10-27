@@ -82,6 +82,15 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         assert len(analytics["model_metrics"]) == 4
         assert analytics["documents"] >= 20
         assert analytics["stage_metrics"]
+        relevant = main.relevant_terms(research_stage, paper_id=bulk_pid, threshold=0, limit=100, model_ids="mpnet-primary")
+        assert relevant["paper_id"] == bulk_pid
+        assert relevant["category_name"]
+        assert len(relevant["terms"]) <= 100
+        assert all(0 <= term["similarity"] <= 1 for term in relevant["terms"])
+        relaxed = main.relevant_terms(research_stage, threshold=0.45, limit=100)
+        strict = main.relevant_terms(research_stage, threshold=0.80, limit=100)
+        assert relaxed["matched_terms"] >= strict["matched_terms"]
+        assert isinstance(relaxed["dataset_stopwords"], list)
         detail = main.stage_alignment_detail(pm_stage, research_stage, model_ids="mpnet-primary")
         assert detail["recommendations"]
         assert 0 <= detail["alignment"] <= 1
