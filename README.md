@@ -16,6 +16,28 @@ From this folder in PowerShell:
 
 Open <http://127.0.0.1:9001>. Data is stored in `data/dashboard.sqlite3`; uploaded source files are kept in `data/uploads`. The database is seeded only when first created, so edits and deletions survive restarts.
 
+### Linux VPS quick start
+
+The built React interface is committed, so Node.js is not required on the server:
+
+```bash
+git clone https://github.com/Blessing-Mbalaka/Domain_Comparison_Tool.git
+cd Domain_Comparison_Tool
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+./start.sh
+```
+
+Open `http://YOUR_SERVER_IP:9001`. Set another port when needed with `PORT=8080 ./start.sh`. For a public production deployment, run this command under systemd or Docker and put Nginx or Caddy in front for HTTPS. Keep the `data/` directory on persistent storage because it contains SQLite, uploaded papers and cached analysis.
+
+Docker is also supported without PowerShell:
+
+```bash
+docker build -t research-atlas .
+docker run -d --name research-atlas --restart unless-stopped -p 9001:9000 -v research-atlas-data:/app/data research-atlas
+```
+
 Each new upload must be assigned to an existing analytical stage. The dashboard keeps exact phrase presence as a separate audit signal and also calculates concept presence: a document counts as present when its assigned stage matches, the stage name appears exactly, a configured synonym appears, or the selected model reaches at least 0.80 cosine similarity. Corpus presence is the proportion of selected documents meeting that rule and is recalculated incrementally after uploads or edits.
 
 Single and bulk ingestion are supported. A bulk batch accepts up to 100 PDF, DOCX or TXT files, uses each filename as the paper title, applies one primary stage and an optional comparative stage to the batch, and processes the papers through one restart-safe background job. Corpus Analytics presents raw corpus and per-document frequency, plus a semantic top-100 explorer ranked against a selected stage's label, description and synonyms. The explorer supports corpus or document scope, combined or individual models, an adjustable similarity threshold, and automatic removal of standard and corpus-specific stop words. The page also reports document and vocabulary totals, stage-presence rates, and semantic, coverage, concept-presence and exact-presence metrics for every model.
