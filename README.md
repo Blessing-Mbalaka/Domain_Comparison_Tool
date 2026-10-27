@@ -12,7 +12,7 @@ From this folder in PowerShell:
 .\start.ps1
 ```
 
-Open <http://127.0.0.1:9000>. Data is stored in `data/dashboard.sqlite3`; uploaded source files are kept in `data/uploads`. The database is seeded only when first created, so edits and deletions survive restarts.
+Open <http://127.0.0.1:9001>. Data is stored in `data/dashboard.sqlite3`; uploaded source files are kept in `data/uploads`. The database is seeded only when first created, so edits and deletions survive restarts.
 
 ## Development
 
@@ -23,7 +23,7 @@ npm install
 npm run build
 cd ..
 python -m pytest -q
-python -m uvicorn app.main:app --host 127.0.0.1 --port 9000
+python -m uvicorn app.main:app --host 127.0.0.1 --port 9001
 ```
 
 The four names from the legacy export are preserved as selectable analytical projections. Original stage-to-stage scores are imported without modification. New uploads use deterministic, cached local feature-hash vectors so the application works without downloading large neural model checkpoints.
