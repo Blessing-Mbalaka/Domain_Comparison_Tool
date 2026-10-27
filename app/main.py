@@ -175,9 +175,36 @@ def prepare_paper(db: sqlite3.Connection, paper_id: int) -> None:
     db.execute("UPDATE papers SET status='ready',updated_at=? WHERE id=?", (now(), paper_id))
 
 
+def seed_demo_presence(db: sqlite3.Connection) -> None:
+    """Add a transparent synthetic corpus so presence metrics can be previewed."""
+    if db.execute("SELECT value FROM meta WHERE key='demo_presence_version'").fetchone():
+        return
+    demos = [
+        ("Demo — Proposal and feasibility planning", """Research Design begins with a focused problem statement, literature gap and feasible research question. During Project Conception and Feasibility Analysis the team checks participant access, data availability, ethics constraints and expected contribution. Project Chartering and Business Case Development records the sponsor, supervisor, objectives, success criteria and intended research value. Stakeholder Analysis and Requirements Gathering captures expectations from supervisors, participants, funders and knowledge users. Scope Baseline and WBS Design separates literature review, protocol preparation, fieldwork, analysis and writing. Schedule Estimation and Milestone Planning assigns approval, recruitment and submission dates, while Resource Allocation and Budgeting covers researcher time, transcription, software and travel."""),
+        ("Demo — Ethics, governance and stakeholder approval", """The Research Design is reviewed with the ethics committee and participant representatives before recruitment. Stakeholder Analysis and Requirements Gathering identifies consent, privacy, accessibility and reporting needs. Risk Management and Procurement Strategy maintains risks for delayed approval, vulnerable participants, data loss, supplier delays and conflicts of interest. Monitoring, Controlling, and Quality Assurance checks consent records, protocol adherence and secure handling every week. When the committee requests a revised sampling method, Change Control and Variance Mitigation records the reason, approval, schedule effect and new protocol version. The governance log gives the project team an auditable decision trail."""),
+        ("Demo — Fieldwork and data collection operations", """Data Collection uses purposive sampling, interviews, a pilot survey and structured observation. Research Tools include the survey platform, encrypted recorder, transcription software, fieldwork tracker and secure database. Team Mobilization and Communication Planning assigns interviewers, training, escalation routes and weekly coordination. Project Execution and Iterative Implementation releases the instrument after a pilot and improves unclear questions between collection waves. Schedule Estimation and Milestone Planning tracks recruitment and interview targets. Resource Allocation and Budgeting monitors incentives, travel and transcription hours. Risk Management and Procurement Strategy addresses non-response and equipment failure, while Monitoring, Controlling, and Quality Assurance reviews missing fields, consent and sample balance."""),
+        ("Demo — Analysis, validation and quality assurance", """Data Analysis combines descriptive statistics, thematic analysis, coding and comparison across participant groups. Research Tools include Python, qualitative coding software, notebooks and a versioned analysis repository. Validation and Quality applies reliability checks, triangulation, negative-case review, sensitivity analysis and reproducible scripts. Monitoring, Controlling, and Quality Assurance uses a quality checklist for cleaning, code review, traceability and evidence completeness. Risk Management and Procurement Strategy flags biased samples, unstable estimates and interpretation drift. Change Control and Variance Mitigation documents revised coding rules and model assumptions so every analytical change can be reproduced."""),
+        ("Demo — Writing, review and controlled revision", """The writing stage converts Data Analysis into claims supported by tables, quotations and limitations. Validation and Quality requires every conclusion to trace back to evidence and every figure to a reproducible source. Schedule Estimation and Milestone Planning sets dates for chapter drafts, supervisor review and corrections. Change Control and Variance Mitigation records requested revisions, affected chapters, responsible authors and approval status. Monitoring, Controlling, and Quality Assurance checks citations, argument consistency, anonymisation and formatting. Dissemination of Research Findings is prepared early through an article outline, executive summary and stakeholder briefing."""),
+        ("Demo — Dissemination and research benefits", """Dissemination of Research Findings includes the thesis submission, journal manuscript, research data statement, practitioner briefing and feedback workshop. Stakeholder Analysis and Requirements Gathering determines which findings matter to participants, managers, policy users and future researchers. Project Execution and Iterative Implementation pilots the briefing with a small user group and improves clarity. Monitoring, Controlling, and Quality Assurance verifies that public claims match the validated evidence and that confidential details are removed. Resource Allocation and Budgeting reserves editing, design and event costs. The team records uptake indicators, questions and follow-on actions to assess whether the research creates practical value."""),
+    ]
+    stamp = now()
+    created = 0
+    for title, text in demos:
+        existing = db.execute("SELECT id FROM papers WHERE title=? AND source_path='synthetic demo presence corpus'", (title,)).fetchone()
+        if existing:
+            continue
+        pid = db.execute("INSERT INTO papers(title,filename,source_path,text_content,status,selected,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (title, None, "synthetic demo presence corpus", text.strip(), "processing", 1, stamp, stamp)).lastrowid
+        prepare_paper(db, pid)
+        created += 1
+    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('demo_presence_version','1')")
+    emit(db, "demo.presence.seeded", {"papers": created, "synthetic": True})
+    db.commit()
+
+
 def seed(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
     if db.execute("SELECT value FROM meta WHERE key='seed_version'").fetchone():
+        seed_demo_presence(db)
         return
     stamp = now()
     pm = db.execute("INSERT INTO domains(name,description,created_at) VALUES(?,?,?)", ("Project Management", "Lifecycle stages imported from the verified multi-model heatmaps.", stamp)).lastrowid
@@ -220,6 +247,7 @@ def seed(db: sqlite3.Connection) -> None:
     db.execute("INSERT INTO meta(key,value) VALUES('seed_version','1')")
     emit(db, "seed.completed", {"categories": len(names) + len(research_defaults), "papers": len(names), "legacy_scores": len(legacy_rows)})
     db.commit()
+    seed_demo_presence(db)
 
 
 def queue_job(db: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> int:

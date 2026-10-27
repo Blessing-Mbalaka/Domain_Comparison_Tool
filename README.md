@@ -4,6 +4,8 @@ This project upgrades the verified static semantic heatmaps into a persistent Fa
 
 The main Stage Alignment workspace has three modes: **Bi-compare** places research stages on the Y-axis and project-management stages on the X-axis; **Self-compare** compares a lifecycle with itself; and **Corpus evidence** retains the document-by-stage view. Stage cells expose model alignment, corpus co-support, joint exact presence, evidence passages, relevant terms and practical PM-to-research recommendations.
 
+On first run the database also receives six papers labelled `Demo — ...` with source `synthetic demo presence corpus`. They provide transparent, realistic-looking presence, term-count and co-occurrence examples for previewing the interface; they are never represented as uploaded or empirical evidence and can be deleted like ordinary papers.
+
 ## Run
 
 From this folder in PowerShell:

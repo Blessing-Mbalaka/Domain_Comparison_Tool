@@ -11,9 +11,11 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         main.seed(db)
         assert db.execute("SELECT COUNT(*) FROM domains").fetchone()[0] == 2
         assert db.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 17
-        assert db.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 12
+        assert db.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 18
         assert db.execute("SELECT COUNT(*) FROM legacy_scores").fetchone()[0] == 576
-        assert db.execute("SELECT COUNT(*) FROM relationships").fetchone()[0] == 816
+        assert db.execute("SELECT COUNT(*) FROM relationships").fetchone()[0] == 1224
+        assert db.execute("SELECT COUNT(*) FROM papers WHERE source_path='synthetic demo presence corpus'").fetchone()[0] == 6
+        assert db.execute("SELECT COUNT(*) FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.source_path='synthetic demo presence corpus' AND r.exact_presence=1").fetchone()[0] > 0
         domain_id = db.execute("SELECT id FROM domains WHERE name='Research Methodology / Tools'").fetchone()[0]
         stamp = main.now()
         cid = db.execute("INSERT INTO categories(domain_id,name,description,synonyms,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (domain_id, "Interview Analysis", "Analyze interview evidence", json.dumps(["qualitative interviews"]), 9, stamp, stamp)).lastrowid
@@ -41,6 +43,7 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         db.commit()
         main.seed(db)
         assert db.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == before - 1
+        assert db.execute("SELECT COUNT(*) FROM papers WHERE source_path='synthetic demo presence corpus'").fetchone()[0] == 6
 
 
 def test_chunking_and_vectors_are_deterministic():
