@@ -51,6 +51,18 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         pm_id = db.execute("SELECT id FROM domains WHERE name='Project Management'").fetchone()[0]
         research_stage = db.execute("SELECT id FROM categories WHERE domain_id=? ORDER BY id LIMIT 1", (domain_id,)).fetchone()[0]
         pm_stage = db.execute("SELECT id FROM categories WHERE domain_id=? ORDER BY id LIMIT 1", (pm_id,)).fetchone()[0]
+        comparative = main.update_paper(pid, main.PaperIn(title="Corrected upload heading", text_content=edited_text, stage_id=cid, comparison_stage_id=pm_stage))
+        assert comparative["recalculation"] is True
+        assert main.process_one_job() is True
+        assert db.execute("SELECT category_id FROM paper_comparisons WHERE paper_id=?", (pid,)).fetchone()[0] == pm_stage
+        bulk_pid = db.execute("INSERT INTO papers(title,text_content,status,selected,created_at,updated_at) VALUES(?,?,?,?,?,?)", ("Bulk filename title", "A bulk paper about research design and delivery controls.", "queued", 1, stamp, stamp)).lastrowid
+        db.execute("INSERT INTO paper_categories(paper_id,category_id,created_at) VALUES(?,?,?)", (bulk_pid, research_stage, stamp))
+        db.execute("INSERT INTO paper_comparisons(paper_id,category_id,created_at) VALUES(?,?,?)", (bulk_pid, pm_stage, stamp))
+        db.commit()
+        bulk_job = main.queue_job(db, "paper.bulk_process", {"paper_ids": [bulk_pid]})
+        assert main.process_one_job() is True
+        assert db.execute("SELECT status FROM papers WHERE id=?", (bulk_pid,)).fetchone()[0] == "ready"
+        assert db.execute("SELECT status FROM jobs WHERE id=?", (bulk_job,)).fetchone()[0] == "completed"
         db.commit()
         bi = main.stage_alignment(pm_id, domain_id, model_ids="mpnet-primary", metric="alignment")
         assert bi["mode"] == "bi"
@@ -62,6 +74,11 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         assert all(0 <= cell["x_present_documents"] <= cell["x_total_documents"] for cell in concept_bi["cells"])
         assert all(0 <= cell["y_present_documents"] <= cell["y_total_documents"] for cell in concept_bi["cells"])
         assert concept_bi["cells"][0]["x_total_documents"] > 0
+        analytics = main.analytics_summary()
+        assert len(analytics["top_words"]) <= 100
+        assert len(analytics["model_metrics"]) == 4
+        assert analytics["documents"] >= 20
+        assert analytics["stage_metrics"]
         detail = main.stage_alignment_detail(pm_stage, research_stage, model_ids="mpnet-primary")
         assert detail["recommendations"]
         assert 0 <= detail["alignment"] <= 1

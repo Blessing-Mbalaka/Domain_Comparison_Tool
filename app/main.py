@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS domains(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT N
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY,domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',synonyms TEXT NOT NULL DEFAULT '[]',position INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(domain_id,name));
 CREATE TABLE IF NOT EXISTS papers(id INTEGER PRIMARY KEY,title TEXT NOT NULL,filename TEXT,source_path TEXT,text_content TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'ready',selected INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS paper_categories(paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS paper_comparisons(paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY,paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,chunk_index INTEGER NOT NULL,text TEXT NOT NULL,term_counts TEXT NOT NULL DEFAULT '{}',UNIQUE(paper_id,chunk_index));
 CREATE TABLE IF NOT EXISTS embeddings(id INTEGER PRIMARY KEY,entity_type TEXT NOT NULL,entity_id INTEGER NOT NULL,model_id TEXT NOT NULL,vector TEXT NOT NULL,content_hash TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(entity_type,entity_id,model_id));
 CREATE TABLE IF NOT EXISTS relationships(id INTEGER PRIMARY KEY,paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,model_id TEXT NOT NULL,semantic_score REAL NOT NULL,coverage REAL NOT NULL,exact_presence REAL NOT NULL,evidence TEXT NOT NULL DEFAULT '[]',top_terms TEXT NOT NULL DEFAULT '[]',updated_at TEXT NOT NULL,UNIQUE(paper_id,category_id,model_id));
@@ -81,6 +82,7 @@ def migrate_schema(db: sqlite3.Connection) -> None:
     if "presence_reason" not in columns:
         db.execute("ALTER TABLE relationships ADD COLUMN presence_reason TEXT NOT NULL DEFAULT 'not detected'")
     db.execute("CREATE TABLE IF NOT EXISTS paper_categories(paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,created_at TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS paper_comparisons(paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,created_at TEXT NOT NULL)")
     db.commit()
 
 
@@ -159,7 +161,7 @@ def evaluate(db: sqlite3.Connection, paper_id: int, category_id: int) -> None:
     normalized_text = re.sub(r"\s+", " ", paper["text_content"].lower())
     exact = 1.0 if re.sub(r"\s+", " ", cat["name"].lower()).strip() in normalized_text else 0.0
     synonym = next((s for s in json.loads(cat["synonyms"] or "[]") if s.strip() and re.sub(r"\s+", " ", s.lower()).strip() in normalized_text), None)
-    classified = db.execute("SELECT 1 FROM paper_categories WHERE paper_id=? AND category_id=?", (paper_id, category_id)).fetchone() is not None
+    classified = db.execute("SELECT 1 FROM paper_categories WHERE paper_id=? AND category_id=? UNION SELECT 1 FROM paper_comparisons WHERE paper_id=? AND category_id=?", (paper_id, category_id, paper_id, category_id)).fetchone() is not None
     chunk_rows = db.execute("SELECT * FROM chunks WHERE paper_id=? ORDER BY chunk_index", (paper_id,)).fetchall()
     for model_id, _, _ in MODELS:
         cv = cache_embedding(db, "category", category_id, model_id, ctext)
@@ -304,6 +306,12 @@ def process_one_job() -> bool:
             payload = json.loads(row["payload"])
             if row["kind"] == "paper.process":
                 prepare_paper(db, int(payload["paper_id"]))
+            elif row["kind"] == "paper.bulk_process":
+                paper_ids = [int(x) for x in payload.get("paper_ids", [])]
+                for index, paper_id in enumerate(paper_ids, 1):
+                    prepare_paper(db, paper_id)
+                    db.execute("UPDATE jobs SET progress=?,message=?,updated_at=? WHERE id=?", (index / max(1, len(paper_ids)), f"Analysed {index} of {len(paper_ids)} papers", now(), row["id"]))
+                    db.commit()
             elif row["kind"] == "category.recalculate":
                 cid = int(payload["category_id"])
                 for paper in db.execute("SELECT id FROM papers").fetchall(): evaluate(db, paper["id"], cid)
@@ -355,6 +363,7 @@ class PaperIn(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     text_content: str = Field(min_length=1, max_length=5_000_000)
     stage_id: int | None = None
+    comparison_stage_id: int | None = None
 
 
 def rows(sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -445,13 +454,13 @@ def extract_file(path: Path) -> str:
 
 
 @app.get("/api/papers")
-def papers(): return rows("SELECT p.id,p.title,p.filename,p.source_path,p.status,p.selected,p.created_at,p.updated_at,length(p.text_content) AS characters,pc.category_id stage_id,c.name stage_name FROM papers p LEFT JOIN paper_categories pc ON pc.paper_id=p.id LEFT JOIN categories c ON c.id=pc.category_id ORDER BY p.id DESC")
+def papers(): return rows("SELECT p.id,p.title,p.filename,p.source_path,p.status,p.selected,p.created_at,p.updated_at,length(p.text_content) AS characters,pc.category_id stage_id,c.name stage_name,cmp.category_id comparison_stage_id,cc.name comparison_stage_name FROM papers p LEFT JOIN paper_categories pc ON pc.paper_id=p.id LEFT JOIN categories c ON c.id=pc.category_id LEFT JOIN paper_comparisons cmp ON cmp.paper_id=p.id LEFT JOIN categories cc ON cc.id=cmp.category_id ORDER BY p.id DESC")
 
 
 @app.get("/api/papers/{paper_id}")
 def paper_detail(paper_id: int):
     with closing(connect()) as db:
-        row = db.execute("SELECT p.id,p.title,p.filename,p.source_path,p.text_content,p.status,p.selected,p.created_at,p.updated_at,pc.category_id stage_id,c.name stage_name FROM papers p LEFT JOIN paper_categories pc ON pc.paper_id=p.id LEFT JOIN categories c ON c.id=pc.category_id WHERE p.id=?", (paper_id,)).fetchone()
+        row = db.execute("SELECT p.id,p.title,p.filename,p.source_path,p.text_content,p.status,p.selected,p.created_at,p.updated_at,pc.category_id stage_id,c.name stage_name,cmp.category_id comparison_stage_id,cc.name comparison_stage_name FROM papers p LEFT JOIN paper_categories pc ON pc.paper_id=p.id LEFT JOIN categories c ON c.id=pc.category_id LEFT JOIN paper_comparisons cmp ON cmp.paper_id=p.id LEFT JOIN categories cc ON cc.id=cmp.category_id WHERE p.id=?", (paper_id,)).fetchone()
         if not row: raise HTTPException(404, "Paper not found")
         return dict(row)
 
@@ -465,13 +474,20 @@ def update_paper(paper_id: int, body: PaperIn):
         if not current: raise HTTPException(404, "Paper not found")
         text_changed = current["text_content"] != text
         old_stage = db.execute("SELECT category_id FROM paper_categories WHERE paper_id=?", (paper_id,)).fetchone()
+        old_comparison = db.execute("SELECT category_id FROM paper_comparisons WHERE paper_id=?", (paper_id,)).fetchone()
         stage_supplied = "stage_id" in body.model_fields_set
+        comparison_supplied = "comparison_stage_id" in body.model_fields_set
         stage_changed = stage_supplied and (old_stage["category_id"] if old_stage else None) != body.stage_id
-        if body.stage_id is not None and not db.execute("SELECT 1 FROM categories WHERE id=?", (body.stage_id,)).fetchone(): raise HTTPException(422, "Selected research stage does not exist")
+        comparison_changed = comparison_supplied and (old_comparison["category_id"] if old_comparison else None) != body.comparison_stage_id
+        if body.stage_id is not None and not db.execute("SELECT 1 FROM categories WHERE id=?", (body.stage_id,)).fetchone(): raise HTTPException(422, "Selected primary stage does not exist")
+        if body.comparison_stage_id is not None and not db.execute("SELECT 1 FROM categories WHERE id=?", (body.comparison_stage_id,)).fetchone(): raise HTTPException(422, "Selected comparative stage does not exist")
         if stage_supplied:
             db.execute("DELETE FROM paper_categories WHERE paper_id=?", (paper_id,))
             if body.stage_id is not None: db.execute("INSERT INTO paper_categories(paper_id,category_id,created_at) VALUES(?,?,?)", (paper_id, body.stage_id, now()))
-        recalculation = text_changed or stage_changed
+        if comparison_supplied:
+            db.execute("DELETE FROM paper_comparisons WHERE paper_id=?", (paper_id,))
+            if body.comparison_stage_id is not None: db.execute("INSERT INTO paper_comparisons(paper_id,category_id,created_at) VALUES(?,?,?)", (paper_id, body.comparison_stage_id, now()))
+        recalculation = text_changed or stage_changed or comparison_changed
         status = "queued" if recalculation else current["status"]
         db.execute("UPDATE papers SET title=?,text_content=?,status=?,updated_at=? WHERE id=?", (title, text, status, now(), paper_id))
         if recalculation:
@@ -484,7 +500,7 @@ def update_paper(paper_id: int, body: PaperIn):
 
 
 @app.post("/api/papers/upload", status_code=202)
-async def upload_paper(file: UploadFile=File(...), title: str=Form(""), stage_id: int=Form(...)):
+async def upload_paper(file: UploadFile=File(...), title: str=Form(""), stage_id: int=Form(...), comparison_stage_id: int | None=Form(None)):
     suffix=Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED: raise HTTPException(415,"Upload a PDF, DOCX or TXT file")
     blob=await file.read()
@@ -495,9 +511,37 @@ async def upload_paper(file: UploadFile=File(...), title: str=Form(""), stage_id
     if not text.strip(): path.unlink(missing_ok=True); raise HTTPException(422,"No readable text was extracted")
     with closing(connect()) as db:
         if not db.execute("SELECT 1 FROM categories WHERE id=?", (stage_id,)).fetchone(): path.unlink(missing_ok=True); raise HTTPException(422,"Selected research stage does not exist")
+        if comparison_stage_id is not None and not db.execute("SELECT 1 FROM categories WHERE id=?", (comparison_stage_id,)).fetchone(): path.unlink(missing_ok=True); raise HTTPException(422,"Selected comparative stage does not exist")
         stamp=now(); pid=db.execute("INSERT INTO papers(title,filename,source_path,text_content,status,selected,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(title.strip() or Path(file.filename or "Untitled").stem,file.filename,str(path),text,"queued",1,stamp,stamp)).lastrowid
         db.execute("INSERT INTO paper_categories(paper_id,category_id,created_at) VALUES(?,?,?)", (pid, stage_id, stamp))
+        if comparison_stage_id is not None: db.execute("INSERT INTO paper_comparisons(paper_id,category_id,created_at) VALUES(?,?,?)", (pid, comparison_stage_id, stamp))
         jid=queue_job(db,"paper.process",{"paper_id":pid}); return {"paper_id":pid,"job_id":jid,"status":"queued","characters":len(text)}
+
+
+@app.post("/api/papers/bulk-upload", status_code=202)
+async def bulk_upload_papers(files: list[UploadFile]=File(...), stage_id: int=Form(...), comparison_stage_id: int | None=Form(None)):
+    if not files: raise HTTPException(422, "Choose at least one paper")
+    if len(files) > 100: raise HTTPException(413, "Bulk upload is limited to 100 papers at a time")
+    accepted, errors = [], []
+    with closing(connect()) as db:
+        if not db.execute("SELECT 1 FROM categories WHERE id=?", (stage_id,)).fetchone(): raise HTTPException(422,"Selected primary stage does not exist")
+        if comparison_stage_id is not None and not db.execute("SELECT 1 FROM categories WHERE id=?", (comparison_stage_id,)).fetchone(): raise HTTPException(422,"Selected comparative stage does not exist")
+        for file in files:
+            suffix=Path(file.filename or "").suffix.lower()
+            if suffix not in ALLOWED: errors.append({"filename":file.filename,"error":"Unsupported file type"}); continue
+            blob=await file.read()
+            if len(blob)>30*1024*1024: errors.append({"filename":file.filename,"error":"File exceeds 30 MB"}); continue
+            path=UPLOADS/f"{uuid.uuid4().hex}{suffix}"; path.write_bytes(blob)
+            try: text=extract_file(path)
+            except Exception as exc: path.unlink(missing_ok=True); errors.append({"filename":file.filename,"error":f"Extraction failed: {exc}"}); continue
+            if not text.strip(): path.unlink(missing_ok=True); errors.append({"filename":file.filename,"error":"No readable text"}); continue
+            stamp=now(); pid=db.execute("INSERT INTO papers(title,filename,source_path,text_content,status,selected,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(Path(file.filename or "Untitled").stem,file.filename,str(path),text,"queued",1,stamp,stamp)).lastrowid
+            db.execute("INSERT INTO paper_categories(paper_id,category_id,created_at) VALUES(?,?,?)",(pid,stage_id,stamp))
+            if comparison_stage_id is not None: db.execute("INSERT INTO paper_comparisons(paper_id,category_id,created_at) VALUES(?,?,?)",(pid,comparison_stage_id,stamp))
+            accepted.append({"paper_id":pid,"filename":file.filename,"title":Path(file.filename or "Untitled").stem,"characters":len(text)})
+        if not accepted: db.rollback(); raise HTTPException(422,{"message":"No papers could be imported","files":errors})
+        jid=queue_job(db,"paper.bulk_process",{"paper_ids":[item["paper_id"] for item in accepted]})
+        return {"job_id":jid,"status":"queued","accepted":accepted,"errors":errors}
 
 
 @app.patch("/api/papers/{paper_id}/selection")
@@ -682,6 +726,24 @@ def phrases(paper_ids:str="",limit:int=Query(20,ge=1,le=100)):
         sql="SELECT text_content FROM papers WHERE selected=1"; args:list[Any]=[]
         if ids: sql+=f" AND id IN ({','.join('?'*len(ids))})"; args=ids
         text=" ".join(x[0] for x in db.execute(sql,args).fetchall()); return top_phrases(text,limit)
+
+
+@app.get("/api/analytics/summary")
+def analytics_summary():
+    with closing(connect()) as db:
+        paper_rows=db.execute("SELECT id,text_content,status FROM papers WHERE selected=1").fetchall()
+        tokens=[token for paper in paper_rows for token in tokenize(paper["text_content"])]
+        counts=Counter(tokens)
+        model_rows=db.execute("SELECT r.model_id,AVG(r.semantic_score) semantic_score,AVG(r.coverage) coverage,AVG(r.concept_presence) concept_presence,AVG(r.exact_presence) exact_presence,COUNT(*) relationships FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.selected=1 GROUP BY r.model_id ORDER BY r.model_id").fetchall()
+        model_names={model_id:name for model_id,name,_ in MODELS}
+        model_metrics=[{**dict(row),"name":model_names.get(row["model_id"],row["model_id"])} for row in model_rows]
+        stages=[]
+        for category in db.execute("SELECT c.id,c.name,d.name domain FROM categories c JOIN domains d ON d.id=c.domain_id ORDER BY d.id,c.position,c.id").fetchall():
+            grouped=db.execute("SELECT r.paper_id,MAX(r.concept_presence) present,AVG(r.semantic_score) semantic_score FROM relationships r JOIN papers p ON p.id=r.paper_id WHERE p.selected=1 AND r.category_id=? GROUP BY r.paper_id",(category["id"],)).fetchall()
+            present=sum(1 for row in grouped if row["present"])
+            stages.append({"id":category["id"],"name":category["name"],"domain":category["domain"],"present_documents":present,"total_documents":len(grouped),"presence_rate":round(present/max(1,len(grouped)),6),"semantic_score":round(sum(row["semantic_score"] for row in grouped)/max(1,len(grouped)),6)})
+        job_counts={row["status"]:row["count"] for row in db.execute("SELECT status,COUNT(*) count FROM jobs GROUP BY status").fetchall()}
+        return {"documents":len(paper_rows),"ready_documents":sum(1 for row in paper_rows if row["status"]=="ready"),"total_words":len(tokens),"unique_words":len(counts),"top_words":[{"word":word,"count":count} for word,count in counts.most_common(100)],"model_metrics":model_metrics,"stage_metrics":stages,"jobs":job_counts}
 
 
 @app.get("/api/legacy-scores")
