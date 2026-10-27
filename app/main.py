@@ -316,6 +316,11 @@ class CategoryIn(BaseModel):
     position: int = 0
 
 
+class PaperIn(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    text_content: str = Field(min_length=1, max_length=5_000_000)
+
+
 def rows(sql: str, args: tuple = ()) -> list[dict[str, Any]]:
     with closing(connect()) as db: return [dict(x) for x in db.execute(sql, args).fetchall()]
 
@@ -405,6 +410,33 @@ def extract_file(path: Path) -> str:
 
 @app.get("/api/papers")
 def papers(): return rows("SELECT id,title,filename,source_path,status,selected,created_at,updated_at,length(text_content) AS characters FROM papers ORDER BY id DESC")
+
+
+@app.get("/api/papers/{paper_id}")
+def paper_detail(paper_id: int):
+    with closing(connect()) as db:
+        row = db.execute("SELECT id,title,filename,source_path,text_content,status,selected,created_at,updated_at FROM papers WHERE id=?", (paper_id,)).fetchone()
+        if not row: raise HTTPException(404, "Paper not found")
+        return dict(row)
+
+
+@app.put("/api/papers/{paper_id}")
+def update_paper(paper_id: int, body: PaperIn):
+    title, text = body.title.strip(), body.text_content.strip()
+    if not title or not text: raise HTTPException(422, "Title and extracted text cannot be blank")
+    with closing(connect()) as db:
+        current = db.execute("SELECT title,text_content,status FROM papers WHERE id=?", (paper_id,)).fetchone()
+        if not current: raise HTTPException(404, "Paper not found")
+        text_changed = current["text_content"] != text
+        status = "queued" if text_changed else current["status"]
+        db.execute("UPDATE papers SET title=?,text_content=?,status=?,updated_at=? WHERE id=?", (title, text, status, now(), paper_id))
+        if text_changed:
+            db.execute("DELETE FROM embeddings WHERE entity_type='paper' AND entity_id=?", (paper_id,))
+            db.execute("DELETE FROM relationships WHERE paper_id=?", (paper_id,))
+            job_id = queue_job(db, "paper.process", {"paper_id": paper_id})
+        else:
+            emit(db, "paper.updated", {"id": paper_id, "recalculation": False}); db.commit(); job_id = None
+        return {"id": paper_id, "status": status, "job_id": job_id, "recalculation": text_changed}
 
 
 @app.post("/api/papers/upload", status_code=202)

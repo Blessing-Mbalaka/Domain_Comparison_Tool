@@ -26,6 +26,19 @@ def test_seed_embedding_jobs_and_persistence(tmp_path):
         assert rel is not None
         assert json.loads(rel["top_terms"])
         assert json.loads(rel["evidence"])
+        edited_text = "Corrected spelling for qualitative interview analysis and project risk controls."
+        edited = main.update_paper(pid, main.PaperIn(title="Corrected upload title", text_content=edited_text))
+        assert edited["recalculation"] is True
+        assert edited["job_id"] is not None
+        assert main.process_one_job() is True
+        refreshed = db.execute("SELECT title,text_content,status FROM papers WHERE id=?", (pid,)).fetchone()
+        assert refreshed["title"] == "Corrected upload title"
+        assert refreshed["text_content"] == edited_text
+        assert refreshed["status"] == "ready"
+        assert db.execute("SELECT COUNT(*) FROM relationships WHERE paper_id=?", (pid,)).fetchone()[0] > 0
+        title_only = main.update_paper(pid, main.PaperIn(title="Corrected upload heading", text_content=edited_text))
+        assert title_only["recalculation"] is False
+        assert title_only["job_id"] is None
         pm_id = db.execute("SELECT id FROM domains WHERE name='Project Management'").fetchone()[0]
         research_stage = db.execute("SELECT id FROM categories WHERE domain_id=? ORDER BY id LIMIT 1", (domain_id,)).fetchone()[0]
         pm_stage = db.execute("SELECT id FROM categories WHERE domain_id=? ORDER BY id LIMIT 1", (pm_id,)).fetchone()[0]
